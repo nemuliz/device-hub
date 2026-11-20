@@ -1104,3 +1104,27 @@ get/set は cmd が +0x80/同一値の関係。`devID` はプロファイル番�
 - 公式の日本語表示名: 移動同期 / 直線補正 / リップル / LOD / ガラスモード / 20K FPS / 競技モード / 角度調整 /
   スリープ時間 / スクロールBhop / ホイール応答時間 / デバウンスタイム / 高速トリガー / ドングルLED (信号) /
   プロファイルをリセット / 完全初期化。X-Y軸分離は DPI タブの X/Y 切り替えで扱う (設定行には出さない)。
+
+
+## HM66 (Sikakeyb Castle) — serial protocol (captured 2026-11-20)
+ - VID 0xC019 PID 0x1234, CDC ACM on COM (QSerialPort). Config is NOT over HID.
+ - Frame size 32 bytes. Leading command byte:
+   - 0x17 0x01 0x00 0x83 ...  : read settings (response echoes same header + payload)
+   - 0x16 0xNN ...              : per-key / lighting writes (response echoes)
+   - 0x19 0xXX ...              : key-matrix reads (32B pages)
+   - 0x01 0x02 0x06 ...         : bulk keymap dump
+ - Requires a serial transport backend in devhub-hid (not yet implemented); registered as unsupported.
+
+## MCHOSE L7 Ultra (VID 0x5253 PID 0x1020)
+ - Config interface: usage page 0xFF0B / usage 0x0104 (64B feature report).
+ - Read (feature report, body = [cmd, sub, 0xFF x62]):
+     0x11 0x06  mouseDeviceRead (vid,pid,fwVersion,connectMode,connectStatus,batteryLevel,chargeStatus)
+     0x12 0x67  mouseAllRead (profileIndex,gDpiIndex/gRateIndex,usbDpiIndex/usbRateIndex,dpi0..5,
+                  dpiSum,sensor,keyDebounce,sleep,buttonType/Index/Value x6, reserved x5,rotateVal,val,dpiVal0..5)
+     0x11 0x1b  mouseLightRead (enable,id,useIndependent,brightness,lightSetting,closeTime,speed,
+                  openRandomColor,rgb,rgb2,changeDirect)
+ - Write (output report id 0x4D, getCommandBuffer layout):
+     [flags=1, len, cmdId_lo, cmdId_hi, bizCode=0, seq=0, data..., xor, 0...]
+     cmdId: 0x0101 mouseKeyToArr, 0x0102 allInfoToArr, 0x0103 dpiToArr,
+            0x0104 setSingleDpi, 0x0109 lodToArr, 0x010a adaptivePowerToArr.
+ - Driver: crates/devhub-hid/src/mchose.rs (read + DPI/polling/sleep/debounce/angle writes).
