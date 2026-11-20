@@ -29,3 +29,19 @@ with MIT terms for icons derived from Feather). See `licenses/lucide-LICENSE`.
 The repository documents observed protocol behavior and includes device
 report captures used as test fixtures. Copies of vendor web bundles and
 extracted source files are kept outside the tracked source tree.
+
+Device protocol support added in this fork was derived from **observed**
+behavior only:
+
+- **MCHOSE L7 Ultra** (`crates/devhub-hid/src/mchose.rs`): byte layouts and
+  command codes were reverse-engineered from the public MCHOSE HUB web bundle
+  (`www.mchose.com.cn`) and confirmed with USBPcap captures of the vendor app.
+  No vendor source code was copied; the driver is an independent Rust
+  re-implementation of the observed on-wire protocol.
+- **HM66 (Sikakeyb Castle)**: serial frame format documented from USBPcap
+  captures of the vendor Qt application (`hm-mag`). No vendor source code was
+  copied or decompiled; only USB traffic was recorded.
+
+The protocol facts themselves (command bytes, field offsets) are not
+copyrightable expression, and all implementation code in this repository is
+original, licensed under the project's dual MIT/Apache-2.0 terms.
