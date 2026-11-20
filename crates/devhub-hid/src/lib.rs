@@ -25,6 +25,7 @@ pub mod lamzu;
 #[allow(dead_code)]
 mod mousefit;
 mod mousefit8;
+mod mchose;
 /// 生 HID チャネル。診断 example (axraw 等) が直接フレームを投げるために公開。
 #[doc(hidden)]
 pub mod transport;
@@ -53,6 +54,7 @@ fn driver_ready(kind: DriverKind) -> bool {
         DriverKind::Walkplay => true,
         DriverKind::Atk => true,
         DriverKind::Lamzu => true,
+        DriverKind::Mchose => true,
         DriverKind::Unsupported => false,
     }
 }
@@ -287,6 +289,7 @@ impl RealHub {
             DriverKind::Walkplay => Arc::new(walkplay::open(dev, info)?),
             DriverKind::Atk => Arc::new(atk::open(dev, info, events)?),
             DriverKind::Lamzu => Arc::new(lamzu::open(dev, info, events)?),
+            DriverKind::Mchose => Arc::new(mchose::open(dev, info)?),
             DriverKind::Unsupported => {
                 return Err(HubError::NotImplemented("このデバイスのドライバ"))
             }

@@ -265,6 +265,23 @@ pub const KNOWN: &[KnownDevice] = &[
         driver: DriverKind::Lamzu,
         verified: false,
     },
+    // ---------------------------------------------------------------- マウス (mchose.com.cn)
+    // MCHOSE L7 Ultra — 実機列挙: 5253:1020, usage page 0xFF0B/0x0104 (config) と 0xFF01/0x01 (aux)。
+    // プロトコルは 64B feature report (report id 6 wired / 19 wireless)、コマンド表は
+    // readMap$1 (0x11/0x12 系) + writeCommandConfig。caps は mouseAllRead (0x12 0x67) から組み立てる。
+    KnownDevice {
+        vid: 0x5253,
+        pid: 0x1020,
+        usage_page: Some(0xFF0B),
+        usage: Some(0x0104),
+        kind: DeviceKind::Mouse,
+        vendor: "MCHOSE",
+        model: "l7-ultra",
+        name: "MCHOSE L7 Ultra",
+        transport: Transport::Wired,
+        driver: DriverKind::Mchose,
+        verified: false,
+    },
 ];
 
 /// 列挙結果 (VID/PID/usage) に合う既知デバイス。`0xFFFF` のプレースホルダは一致しない。

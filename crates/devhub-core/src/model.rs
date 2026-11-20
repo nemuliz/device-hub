@@ -72,6 +72,9 @@ pub enum DriverKind {
     Atk,
     /// www.lamzu.net / Aurora 系 (64B feature report、if2 FFFF:00)。
     Lamzu,
+    /// www.mchose.com.cn / MCHOSE HUB 系 (MCHOSE L7 Ultra 等。64B feature report、
+    /// vendor usage page 0xFF0B / 0x0104)。
+    Mchose,
     /// 未割り当て (検出だけできる)。
     Unsupported,
 }
