@@ -26,6 +26,8 @@ pub mod lamzu;
 mod mousefit;
 mod mousefit8;
 mod mchose;
+mod serial;
+mod hm66;
 /// 生 HID チャネル。診断 example (axraw 等) が直接フレームを投げるために公開。
 #[doc(hidden)]
 pub mod transport;
@@ -55,6 +57,7 @@ fn driver_ready(kind: DriverKind) -> bool {
         DriverKind::Atk => true,
         DriverKind::Lamzu => true,
         DriverKind::Mchose => true,
+        DriverKind::Hm66 => true,
         DriverKind::Unsupported => false,
     }
 }
@@ -143,6 +146,63 @@ impl HubBackend for RealHub {
                 board_id: None,
             });
         }
+        // ---------------------------------------------------------------- シリアル (HM66 等)
+        // COM1..COM20 を短いタイムアウトでプローブし、HM66 の読み取りコマンドに
+        // 応答するポートを HM66 として登録する (HID 列挙では見えない)。
+        for n in 1u8..=20 {
+            let port = format!("COM{}", n);
+            // 既に登録済みならスキップ (パスが同じなら再プローブしない)
+            let already = paths.values().any(|p| p.to_string_lossy() == port);
+            if already {
+                continue;
+            }
+            // プローブ: ポートを開き、HM66 の read コマンドを送って応答を確認
+            if let Ok(mut sp) = serial::SerialPort::open(&port, 9600) {
+                // 送信: 0x17 0x01 0x00 0x83 + 28 bytes 0x00 (32 bytes)
+                let mut cmd = [0u8; 32];
+                cmd[0] = 0x17;
+                cmd[1] = 0x01;
+                cmd[2] = 0x00;
+                cmd[3] = 0x83;
+                let _ = sp.write_all(&cmd);
+                // 応答待ち (最大 ~250ms)
+                let mut buf = [0u8; 32];
+                let mut got = 0usize;
+                let start = std::time::Instant::now();
+                while got < 32 && start.elapsed().as_millis() < 250 {
+                    match sp.read(&mut buf[got..]) {
+                        Ok(0) => break,
+                        Ok(k) => got += k,
+                        Err(_) => break,
+                    }
+                }
+                if got >= 4 && buf[0] == 0x17 && buf[1] == 0x01 && buf[2] == 0x00 && buf[3] == 0x83 {
+                    let id = DeviceId(format!("serial:0c19:1234:{}", port));
+                    if out.iter().any(|o| o.id == id) {
+                        continue;
+                    }
+                    paths.insert(id.0.clone(), std::ffi::CString::new(port.clone()).unwrap());
+                    out.push(DeviceInfo {
+                        id,
+                        kind: DeviceKind::Keyboard,
+                        name: "HM66".into(),
+                        vendor: "Sikakeyb".into(),
+                        model: "hm66".into(),
+                        vid: 0x0C19,
+                        pid: 0x1234,
+                        transport: Transport::Wired,
+                        firmware: None,
+                        dongle_firmware: None,
+                        serial: Some(port.clone()),
+                        driver: DriverKind::Hm66,
+                        battery: None,
+                        supported: true,
+                        asleep: false,
+                        board_id: None,
+                    });
+                }
+            }
+        }
         // 抜かれた/差し直されたデバイスのキャッシュは死んだハンドル — パスが
         // 前回と一致するものだけ残し、他は捨てて次回 driver() で開き直す。
         self.drivers
@@ -157,6 +217,51 @@ impl HubBackend for RealHub {
     }
 
     fn driver(&self, id: &DeviceId) -> HubResult<Arc<dyn DeviceDriver>> {
+        // シリアル (CDC) デバイスは HID パスを持たない。
+        if id.0.starts_with("serial:") {
+            if let Some(d) = self
+                .drivers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id.0)
+            {
+                return Ok(d.clone());
+            }
+            // シリアルデバイスの info は scan 時点で組み立て済み (paths には port 名)。
+            let port = self
+                .paths
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id.0)
+                .cloned()
+                .map(|c| c.to_string_lossy().to_string())
+                .ok_or_else(|| HubError::NotFound(id.clone()))?;
+            // id: serial:<vid>:<pid>:<port>
+            let info = DeviceInfo {
+                id: id.clone(),
+                kind: DeviceKind::Keyboard,
+                name: "HM66".into(),
+                vendor: "Sikakeyb".into(),
+                model: "hm66".into(),
+                vid: 0x0C19,
+                pid: 0x1234,
+                transport: Transport::Wired,
+                firmware: None,
+                dongle_firmware: None,
+                serial: Some(port.clone()),
+                driver: DriverKind::Hm66,
+                battery: None,
+                supported: true,
+                asleep: false,
+                board_id: None,
+            };
+            let drv = Arc::new(hm66::open(info)?);
+            self.drivers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id.0.clone(), drv.clone());
+            return Ok(drv);
+        }
         if let Some(d) = self
             .drivers
             .lock()
@@ -290,6 +395,9 @@ impl RealHub {
             DriverKind::Atk => Arc::new(atk::open(dev, info, events)?),
             DriverKind::Lamzu => Arc::new(lamzu::open(dev, info, events)?),
             DriverKind::Mchose => Arc::new(mchose::open(dev, info)?),
+            DriverKind::Hm66 => {
+                return Err(HubError::NotImplemented("hm66 is serial-only"))
+            }
             DriverKind::Unsupported => {
                 return Err(HubError::NotImplemented("このデバイスのドライバ"))
             }

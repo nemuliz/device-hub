@@ -57,6 +57,7 @@ impl Shell {
                         DriverKind::Atk => "ATK HUB 互換".into(),
                         DriverKind::Lamzu => "LAMZU Aurora 互換".into(),
                         DriverKind::Mchose => "MCHOSE HUB 互換".into(),
+                        DriverKind::Hm66 => "HM66 (serial)".into(),
                         DriverKind::Unsupported => "未対応".into(),
                     },
                 ))
