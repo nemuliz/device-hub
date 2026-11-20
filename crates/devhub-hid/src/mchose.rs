@@ -112,11 +112,9 @@ impl MchoseMouse {
             xor ^= buf[i];
         }
         buf[6 + data.len()] = xor;
-        // 0x4D は HID レポートディスクリプタに無い (Windows の hid_write が
-        // WriteFile で失敗する)。WebHID の sendReport は OS 側で feature report
-        // 相当として送出されるため、ここでは send_feature_report を使う。
+        // L7 Ultra の書き込みは feature report (report id 0x12, 64B) を使う。
         let mut out = [0u8; 65];
-        out[0] = 0x4D;
+        out[0] = 0x12;
         out[1..].copy_from_slice(&buf);
         dev.send_feature_report(&out)
             .map_err(|e| HubError::Io(format!("mchose write: {e}")))?;
