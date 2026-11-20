@@ -71,16 +71,18 @@ fn build_all_info(last: &AllRead) -> Vec<u8> {
 }
 
 impl MchoseMouse {
-    fn send_feature_read(dev: &hidapi::HidDevice, cmd: u8, sub: u8) -> HubResult<Vec<u8>> {
-        // body = [cmd, sub^0xFF, 0xFF, 0xFF, ...] (64B) — cmd が report id、
+    fn send_feature_read(dev: &hidapi::HidDevice, cmd: u8, sub: u8, len: usize) -> HubResult<Vec<u8>> {
+        // body = [cmd, sub^0xFF, 0xFF, ...] (len B) — cmd が report id、
         // サブコマンド以降は XOR 0xFF で反転して送る (JS の readCommand と同じ)。
-        let mut buf = [0xFFu8; 64];
+        let mut buf = vec![0xFFu8; len];
         buf[0] = cmd;
-        buf[1] = sub ^ 0xFF;
+        if len > 1 {
+            buf[1] = sub ^ 0xFF;
+        }
         dev.send_feature_report(&buf)
             .map_err(|e| HubError::Io(format!("mchose feature write: {e}")))?;
         // 応答: get_feature_report は buf[0] に report id を入れて要求
-        let mut resp = [0u8; 65];
+        let mut resp = vec![0u8; len + 1];
         resp[0] = cmd;
         let n = dev
             .get_feature_report(&mut resp)
@@ -197,9 +199,9 @@ pub fn open(dev: hidapi::HidDevice, mut info: DeviceInfo) -> HubResult<MchoseMou
     // 読み取りで info を埋める
     let dev_ref = &dev;
     // mouseDeviceRead
-    let device_data = MchoseMouse::send_feature_read(dev_ref, 0x11, 0x06).unwrap_or_default();
+    let device_data = MchoseMouse::send_feature_read(dev_ref, 0x11, 0x06, 20).unwrap_or_default();
     let (fw, bat, _charge) = MchoseMouse::parse_device(&device_data);
-    let all_data = MchoseMouse::send_feature_read(dev_ref, 0x12, 0x67).unwrap_or_default();
+    let all_data = MchoseMouse::send_feature_read(dev_ref, 0x12, 0x67, 64).unwrap_or_default();
     let mut last_all = MchoseMouse::parse_all(&all_data);
     last_all.fw_version = fw;
     last_all.battery = bat;
@@ -330,8 +332,8 @@ impl DeviceDriver for MchoseMouse {
     }
     fn read(&self) -> HubResult<DeviceState> {
         let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
-        let all_data = Self::send_feature_read(&dev, 0x12, 0x67).unwrap_or_default();
-        let device_data = Self::send_feature_read(&dev, 0x11, 0x06).unwrap_or_default();
+        let all_data = Self::send_feature_read(&dev, 0x12, 0x67, 64).unwrap_or_default();
+        let device_data = Self::send_feature_read(&dev, 0x11, 0x06, 20).unwrap_or_default();
         drop(dev);
 
         let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
