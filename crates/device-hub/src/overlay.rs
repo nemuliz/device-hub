@@ -142,7 +142,7 @@ impl Shell {
             col = col.child(
                 div()
                     .relative()
-                    .max_w(px(420.))
+                    .max_w(px(720.))
                     .px(px(14.))
                     .py(px(10.))
                     .flex()
@@ -173,6 +173,7 @@ impl Shell {
                             .relative()
                             .text_size(px(13.))
                             .text_color(p.fg)
+                            .whitespace_normal()
                             .child(t.msg.clone()),
                     )
                     .id(SharedString::from(format!("toast-{i}"))),

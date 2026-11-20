@@ -272,8 +272,8 @@ pub const KNOWN: &[KnownDevice] = &[
     KnownDevice {
         vid: 0x5253,
         pid: 0x1020,
-        usage_page: Some(0xFF0B),
-        usage: Some(0x0104),
+        usage_page: Some(0xFF01),
+        usage: Some(0x01),
         kind: DeviceKind::Mouse,
         vendor: "MCHOSE",
         model: "l7-ultra",
