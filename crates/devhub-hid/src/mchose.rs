@@ -72,22 +72,22 @@ fn build_all_info(last: &AllRead) -> Vec<u8> {
 
 impl MchoseMouse {
     fn send_feature_read(dev: &hidapi::HidDevice, cmd: u8, sub: u8) -> HubResult<Vec<u8>> {
-        // body = [cmd, sub, 0xFF, 0xFF, ...] (64B)
-        let mut body = [0xFFu8; 64];
-        body[0] = cmd;
-        body[1] = sub;
-        let mut buf = [0u8; 65];
-        buf[1..].copy_from_slice(&body);
+        // body = [cmd, sub, 0xFF, 0xFF, ...] (64B) — cmd が report id
+        let mut buf = [0xFFu8; 64];
+        buf[0] = cmd;
+        buf[1] = sub;
         dev.send_feature_report(&buf)
             .map_err(|e| HubError::Io(format!("mchose feature write: {e}")))?;
-        // 応答は get_feature_report で同期取得
+        // 応答: get_feature_report は buf[0] に report id を入れて要求
         let mut resp = [0u8; 65];
+        resp[0] = cmd;
         let n = dev
             .get_feature_report(&mut resp)
             .map_err(|e| HubError::Io(format!("mchose feature read: {e}")))?;
         if n < 2 {
             return Err(HubError::Protocol("empty feature report".into()));
         }
+        // resp[0] = report id, resp[1..] = data
         Ok(resp[1..].to_vec())
     }
 
@@ -112,11 +112,13 @@ impl MchoseMouse {
             xor ^= buf[i];
         }
         buf[6 + data.len()] = xor;
-        // send as output report id 0x4D
+        // 0x4D は HID レポートディスクリプタに無い (Windows の hid_write が
+        // WriteFile で失敗する)。WebHID の sendReport は OS 側で feature report
+        // 相当として送出されるため、ここでは send_feature_report を使う。
         let mut out = [0u8; 65];
         out[0] = 0x4D;
         out[1..].copy_from_slice(&buf);
-        dev.write(&out)
+        dev.send_feature_report(&out)
             .map_err(|e| HubError::Io(format!("mchose write: {e}")))?;
         // 少し待つ (デバイス処理)
         std::thread::sleep(Duration::from_millis(50));
