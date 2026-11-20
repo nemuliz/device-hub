@@ -2,14 +2,15 @@
 //!
 //! www.mchose.com.cn の WebHID プロトコル (JS 解析) を Rust に移植。
 //!
-//! - 設定チャネル: vendor usage page 0xFF0B / usage 0x0104、64B feature report
-//!   (report id 0 先頭に 0x11/0x12 コマンド) で読み出し、
-//!   output report id 0x4D (77) の構造化バッファで書き込み。
-//! - 読み: `0x11 0x06` (mouseDeviceRead) / `0x12 0x67` (mouseAllRead) /
-//!   `0x11 0x1b` (mouseLightRead)。応答は feature report で同期的に返る。
-//! - 書き: `getCommandBuffer` 形式 (flags/len/cmdId/bizCode/seq/data/xor) を
-//!   output report 0x4D で送る。コマンド: 0x0102 (allInfo), 0x0103 (dpi),
-//!   0x0104 (single dpi), 0x0109 (lod), 0x010a (adaptive power)。
+//! - 設定チャネル: vendor usage page 0xFF01 / usage 0x0001 の feature report。
+//! - 読み: `0x11 0x06` (device) / `0x11 0x04` (firmware string) /
+//!   `0x12 0x67` (allInfo)。応答は XOR 0xFF 反転 + エコー subcommand 付き。
+//! - 書き: 読みと同じ feature report に、report id + XOR 0xFF 反転データ +
+//!   0xFF パディングを送る。MCHOSE HUB の `setCommand` と同一形式。
+//!   - DPI: report `0x12` / command `0x40` (dpiXYSetParser)
+//!   - レート: report `0x11` / command `0x41` (reportParser)
+//!   - スリープ: report `0x11` / command `0x0A`
+//!   - デバウンス: report `0x11` / command `0x43`
 
 use devhub_core::backend::*;
 use devhub_core::model::*;
@@ -38,36 +39,8 @@ struct AllRead {
     rotate_val: u8,
     battery: u8,
     fw_version: u32,
-}
-
-fn build_all_info(last: &AllRead) -> Vec<u8> {
-    // allInfoToArr layout
-    let mut data: Vec<u8> = Vec::new();
-    data.push(last.profile_index);
-    let aa = if last.usb_rate_index > 0 {
-        last.usb_rate_index + 1
-    } else {
-        last.usb_rate_index
-    };
-    let ra = if last.g_rate_index > 0 {
-        last.g_rate_index + 1
-    } else {
-        last.g_rate_index
-    };
-    let oa = ((aa as u8) & 0x0F) << 4 | (last.usb_dpi_index & 0x0F);
-    let ia = ((ra as u8) & 0x0F) << 4 | (last.usb_dpi_index & 0x0F);
-    data.push(oa);
-    data.push(ia);
-    data.push(last.sleep);
-    data.push(0); // sleepMode
-    data.push(last.sensor);
-    data.push(last.rotate_val);
-    data.push(last.key_debounce); // leftKeyDebounce
-    data.push(last.key_debounce); // rightKeyDebounce
-    for _ in 0..10 {
-        data.push(0);
-    }
-    data
+    /// `deviceInfo.connectMode` from `0x11 0x06` (true = 2.4G wireless).
+    connect_mode: bool,
 }
 
 impl MchoseMouse {
@@ -81,6 +54,10 @@ impl MchoseMouse {
         }
         dev.send_feature_report(&buf)
             .map_err(|e| HubError::Io(format!("mchose feature write: {e}")))?;
+        // L7 prepares the feature response asynchronously. In particular,
+        // `mouseAllRead` (0x67) needs roughly 600 ms; reading immediately
+        // yields the previous/default feature buffer.
+        std::thread::sleep(Duration::from_millis(if sub == 0x67 { 650 } else { 150 }));
         // 応答: get_feature_report は buf[0] に report id を入れて要求
         let mut resp = vec![0u8; len + 1];
         resp[0] = cmd;
@@ -90,44 +67,56 @@ impl MchoseMouse {
         if n < 2 {
             return Err(HubError::Protocol("empty feature report".into()));
         }
-        // resp[0] = report id, resp[1..] = data
-        Ok(resp[1..].to_vec())
+        // The payload is XOR-inverted and begins with an echoed subcommand.
+        // For example, device read returns:
+        //   11 f9 ac ad 4e ... -> 06 53 52 b1 ...
+        // Strip the decoded `06`/`67` echo before parsing the actual data.
+        let decoded: Vec<u8> = resp[1..n].iter().map(|b| b ^ 0xFF).collect();
+        if decoded.first() != Some(&sub) {
+            return Err(HubError::Protocol("unexpected MCHOSE feature response".into()));
+        }
+        Ok(decoded[1..].to_vec())
     }
 
-    fn write_report(dev: &hidapi::HidDevice, cmd_id: u16, data: &[u8]) -> HubResult<()> {
-        // getCommandBuffer 形式 (64B 全体、report id 0x4D)
-        let mut buf = [0u8; 64];
-        buf[0] = 1; // flags (na)
-        buf[1] = data.len() as u8; // length
-        buf[2] = (cmd_id & 0xFF) as u8; // cmdId low
-        buf[3] = ((cmd_id >> 8) & 0xFF) as u8; // cmdId high
-        buf[4] = 0; // bizCode
-        buf[5] = 0; // sequence
-        let n = data.len().min(57);
-        buf[6..6 + n].copy_from_slice(&data[..n]);
-        // xor checksum: indices 2..(7+n) inclusive in the 64-byte buffer
-        // = buf[2] ^ buf[3] ^ ... ^ buf[6+n-1]? 
-        // calculateXorSum(ia, 2, 7+ta.length): ia[2..=7+ta.length]
-        // ia index = buffer index. ta.length = data.len(). 7+ta.length = 7+data.len().
-        // inclusive range 2..=7+data.len() → indices 2,3,...,7+data.len()
-        let mut xor: u8 = 0;
-        for i in 2..=(7 + data.len()) {
-            xor ^= buf[i];
+    /// Send a feature report exactly like MCHOSE HUB's `setCommand`.
+    ///
+    /// `data[0]` is the command byte (for example `0x40` for DPI). The report
+    /// id itself is **not** inverted; all following bytes are XOR-inverted and
+    /// padded with `0xFF` to the report size (`0x11` = 20 B, `0x12` = 64 B).
+    fn write_report(dev: &hidapi::HidDevice, report: u8, data: &[u8]) -> HubResult<()> {
+        let payload_len = if report == 0x11 { 20 } else { 64 };
+        if data.is_empty() || data.len() > payload_len {
+            return Err(HubError::Invalid("mchose report length".into()));
         }
-        buf[6 + data.len()] = xor;
-        // L7 Ultra の書き込みは feature report (report id 0x12, 64B) を使う。
-        // 書き込みデータは反転 (XOR 0xFF) で送る (キャプチャで確認)。
-        // レポートサイズは 64B (report id + 63B data)。65B 送ると WriteFile が失敗する。
-        let mut out = [0u8; 64];
-        out[0] = 0x12;
-        for (i, b) in buf.iter().enumerate().take(63) {
-            out[1 + i] = b ^ 0xFF;
+        let mut out = vec![0xFFu8; payload_len + 1];
+        out[0] = report;
+        out[1..1 + data.len()].copy_from_slice(data);
+        for b in &mut out[1..] {
+            *b ^= 0xFF;
         }
         dev.send_feature_report(&out)
             .map_err(|e| HubError::Io(format!("mchose write: {e}")))?;
-        // 少し待つ (デバイス処理)
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(80));
         Ok(())
+    }
+
+    /// `0x12 0x40` dpiXYSetParser. X and Y stages are identical on the L7.
+    fn write_dpi(dev: &hidapi::HidDevice, last: &AllRead) -> HubResult<()> {
+        let mut data: Vec<u8> = vec![0x40, last.usb_dpi_index, last.g_dpi_index, 1];
+        for &v in &last.dpi {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.push(last.dpi_sum);
+        data.push(0xFF); // diff: no separate Y values
+        for &v in &last.dpi {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        Self::write_report(dev, 0x12, &data)
+    }
+
+    /// `0x11 0x41` reportParser. `free_rate` is the 2.4G/wireless rate.
+    fn write_rate(dev: &hidapi::HidDevice, usb_rate: u8, free_rate: u8) -> HubResult<()> {
+        Self::write_report(dev, 0x11, &[0x41, usb_rate, free_rate])
     }
 
     fn parse_all(data: &[u8]) -> AllRead {
@@ -136,10 +125,14 @@ impl MchoseMouse {
             return a;
         }
         a.profile_index = data[0];
-        a.g_dpi_index = (data[1] >> 4) & 0x0F;
-        a.g_rate_index = data[1] & 0x0F;
-        a.usb_dpi_index = (data[2] >> 4) & 0x0F;
-        a.usb_rate_index = data[2] & 0x0F;
+        // mouseAllReadParser uses `endianness("little")`. In binary-parser this
+        // means consecutive bit4 fields are taken from the low nibble first:
+        //   byte 0x23 -> gDpiIndex=3 (low), gRateIndex=2 (high).
+        // Verified on device: writing usb/g = 0/3 reads back `00 23 23 03`.
+        a.g_dpi_index = data[1] & 0x0F;
+        a.g_rate_index = (data[1] >> 4) & 0x0F;
+        a.usb_dpi_index = data[2] & 0x0F;
+        a.usb_rate_index = (data[2] >> 4) & 0x0F;
         // dpi0..dpi5 at offsets 4..16 (u16 LE)
         for i in 0..6usize {
             let off = 4 + i * 2;
@@ -157,41 +150,62 @@ impl MchoseMouse {
         a
     }
 
-    fn parse_device(data: &[u8]) -> (u32, u8, u8) {
-        // fwVersion u32 LE at offset 4, batteryLevel at 9, chargeStatus at 10
+    fn parse_device(data: &[u8]) -> (u32, u8, u8, bool) {
+        // mouseDeviceReadParser:
+        // vid[0..2], pid[2..4], fw[4..8], bitfield[8], battery[9], charge[10].
         let fw = if data.len() >= 8 {
             u32::from_le_bytes([data[4], data[5], data[6], data[7]])
         } else {
             0
         };
+        // mouseDeviceReadParser: bit3 connectMode, bit1 connectStatus,
+        // bit4 reserved — also little-endian bit order. MCHOSE HUB treats
+        // connectMode 0 as wired and 1 as 2.4G.
+        let connect_mode = data.get(8).map(|b| b & 0x07 == 1).unwrap_or(false);
         let bat = if data.len() > 9 { data[9] } else { 0 };
         let charge = if data.len() > 10 { data[10] } else { 0 };
-        (fw, bat, charge)
+        (fw, bat, charge, connect_mode)
     }
 
+    fn parse_version(data: &[u8]) -> Option<String> {
+        let len = *data.first()? as usize;
+        let bytes = data.get(1..1 + len)?;
+        let version = std::str::from_utf8(bytes).ok()?.trim();
+        (!version.is_empty()).then(|| version.to_owned())
+    }
+
+    // L7 Ultra exposes rateMap8K = ["125", "500", "1000", "2000", "4000", "8000"].
     fn rate_index_to_hz(idx: u8) -> u32 {
         match idx {
             0 => 125,
-            1 => 250,
-            2 => 500,
-            3 => 1000,
-            4 => 2000,
-            5 => 4000,
-            6 => 8000,
+            1 => 500,
+            2 => 1000,
+            3 => 2000,
+            4 => 4000,
+            5 => 8000,
             _ => 1000,
         }
     }
     fn hz_to_rate_index(hz: u32) -> u8 {
         match hz {
             125 => 0,
-            250 => 1,
-            500 => 2,
-            1000 => 3,
-            2000 => 4,
-            4000 => 5,
-            8000 => 6,
-            _ => 3,
+            500 => 1,
+            1000 => 2,
+            2000 => 3,
+            4000 => 4,
+            8000 => 5,
+            _ => 2,
         }
+    }
+
+    fn firmware_string(fw: u32) -> String {
+        format!(
+            "{}.{}.{}.{}",
+            fw & 0xFF,
+            (fw >> 8) & 0xFF,
+            (fw >> 16) & 0xFF,
+            (fw >> 24) & 0xFF
+        )
     }
 }
 
@@ -200,13 +214,16 @@ pub fn open(dev: hidapi::HidDevice, mut info: DeviceInfo) -> HubResult<MchoseMou
     let dev_ref = &dev;
     // mouseDeviceRead
     let device_data = MchoseMouse::send_feature_read(dev_ref, 0x11, 0x06, 20).unwrap_or_default();
-    let (fw, bat, _charge) = MchoseMouse::parse_device(&device_data);
+    let (fw, bat, _charge, connect_mode) = MchoseMouse::parse_device(&device_data);
+    let version_data = MchoseMouse::send_feature_read(dev_ref, 0x11, 0x04, 20).unwrap_or_default();
+    let version = MchoseMouse::parse_version(&version_data);
     let all_data = MchoseMouse::send_feature_read(dev_ref, 0x12, 0x67, 64).unwrap_or_default();
     let mut last_all = MchoseMouse::parse_all(&all_data);
     last_all.fw_version = fw;
     last_all.battery = bat;
+    last_all.connect_mode = connect_mode;
 
-    info.firmware = Some(format!("{}.{}", fw >> 16, fw & 0xFFFF));
+    info.firmware = Some(version.unwrap_or_else(|| MchoseMouse::firmware_string(fw)));
     info.battery = Some(Battery {
         percent: Some(bat),
         charging: false,
@@ -228,10 +245,9 @@ fn build_caps() -> Capabilities {
         SettingSpec::choice(
             "polling_rate",
             PERFORMANCE,
-            "ポーリングレート (有線)",
+            "ポーリングレート",
             vec![
                 ChoiceOpt::new(125, "125"),
-                ChoiceOpt::new(250, "250"),
                 ChoiceOpt::new(500, "500"),
                 ChoiceOpt::new(1000, "1K"),
                 ChoiceOpt::new(2000, "2K"),
@@ -239,14 +255,13 @@ fn build_caps() -> Capabilities {
                 ChoiceOpt::new(8000, "8K"),
             ],
         )
-        .help("マウス→PC 間の報告頻度 (Hz)"),
+        .help("接続中のモードの報告頻度 (Hz)"),
         SettingSpec::choice(
             "polling_wireless",
             PERFORMANCE,
             "ポーリングレート (無線)",
             vec![
                 ChoiceOpt::new(125, "125"),
-                ChoiceOpt::new(250, "250"),
                 ChoiceOpt::new(500, "500"),
                 ChoiceOpt::new(1000, "1K"),
                 ChoiceOpt::new(2000, "2K"),
@@ -257,24 +272,11 @@ fn build_caps() -> Capabilities {
         .help("無線時の報告頻度 (Hz)"),
         SettingSpec::slider("sleep", PERFORMANCE, "スリープ時間", 0., 30., 1., "分"),
         SettingSpec::slider("debounce_press", CLICK, "クリックデバウンス", 0., 20., 1., "ms"),
-        SettingSpec::slider("sensor_angle", SENSOR, "センサー角度", -30., 30., 1., "°"),
     ];
-    let buttons = vec![
-        ButtonSlot { name: "左ボタン".into() },
-        ButtonSlot { name: "右ボタン".into() },
-        ButtonSlot { name: "中ボタン".into() },
-        ButtonSlot { name: "サイド前".into() },
-        ButtonSlot { name: "サイド後".into() },
-        ButtonSlot { name: "DPI ボタン".into() },
-    ];
-    let button_kinds = vec![
-        ButtonActionKind::Disabled,
-        ButtonActionKind::Mouse,
-        ButtonActionKind::Dpi,
-        ButtonActionKind::Key,
-        ButtonActionKind::Media,
-        ButtonActionKind::Macro,
-    ];
+    // Button and macro remapping use separate, unverified L7 commands. Do not
+    // advertise controls that this driver cannot safely persist yet.
+    let buttons = vec![];
+    let button_kinds = vec![];
     Capabilities {
         mouse: Some(MouseCaps {
             dpi_min: 50,
@@ -288,15 +290,7 @@ fn build_caps() -> Capabilities {
             buttons,
             button_kinds,
             require_left_click: true,
-            macros: Some(MacroCaps {
-                slots: 5,
-                max_events: 100,
-                max_delay_ms: 10000,
-                modes: vec![],
-                repeat_modes: vec![],
-                names: true,
-                mouse_events: true,
-            }),
+            macros: None,
             live_buttons: vec![],
             adaptive_dpi: None,
         }),
@@ -334,13 +328,15 @@ impl DeviceDriver for MchoseMouse {
         let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
         let all_data = Self::send_feature_read(&dev, 0x12, 0x67, 64).unwrap_or_default();
         let device_data = Self::send_feature_read(&dev, 0x11, 0x06, 20).unwrap_or_default();
+        let version_data = Self::send_feature_read(&dev, 0x11, 0x04, 20).unwrap_or_default();
         drop(dev);
 
         let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
         *last = Self::parse_all(&all_data);
-        let (fw, bat, _) = Self::parse_device(&device_data);
+        let (fw, bat, _, connect_mode) = Self::parse_device(&device_data);
         last.fw_version = fw;
         last.battery = bat;
+        last.connect_mode = connect_mode;
 
         // stages
         let n = (last.dpi_sum as usize).clamp(1, 6);
@@ -353,7 +349,9 @@ impl DeviceDriver for MchoseMouse {
                 enabled: true,
             });
         }
-        let active = (last.g_dpi_index as usize).min(stages.len().saturating_sub(1));
+        // MCHOSE HUB tracks the selected stage with `usbDpiIndex` (low nibble
+        // of allInfo byte 2); `gDpiIndex` is a separate gaming-mode field.
+        let active = (last.usb_dpi_index as usize).min(stages.len().saturating_sub(1));
 
         let buttons = vec![
             ButtonAction::Mouse(MouseFn::Left),
@@ -380,11 +378,15 @@ impl DeviceDriver for MchoseMouse {
             }),
             settings: {
                 let mut m = std::collections::BTreeMap::new();
-                m.insert("polling_rate".into(), SettingValue::Choice(MchoseMouse::rate_index_to_hz(last.g_rate_index) as i64));
+                // Observed on L7 Ultra (2.4G): `0x11 0x41 [cmd, usbRate, freeRate]`
+                // updates the high nibble of allInfo byte 2 (`usb_rate_index`), and
+                // this is the field that reflects the active polling rate after
+                // writes. Use it for the reported/verified rate.
+                let active_rate = last.usb_rate_index;
+                m.insert("polling_rate".into(), SettingValue::Choice(MchoseMouse::rate_index_to_hz(active_rate) as i64));
                 m.insert("polling_wireless".into(), SettingValue::Choice(MchoseMouse::rate_index_to_hz(last.usb_rate_index) as i64));
                 m.insert("sleep".into(), SettingValue::Num(last.sleep as f32));
                 m.insert("debounce_press".into(), SettingValue::Num(last.key_debounce as f32));
-                m.insert("sensor_angle".into(), SettingValue::Num(last.rotate_val as f32));
                 m
             },
             keyboard: None,
@@ -399,7 +401,10 @@ impl DeviceDriver for MchoseMouse {
                 percent: Some(bat),
                 charging: false,
             });
-            info.firmware = Some(format!("{}.{}", fw >> 16, fw & 0xFFFF));
+            info.firmware = Some(
+                Self::parse_version(&version_data)
+                    .unwrap_or_else(|| Self::firmware_string(fw)),
+            );
         }
 
         Ok(state)
@@ -407,75 +412,126 @@ impl DeviceDriver for MchoseMouse {
 
     fn apply(&self, change: &Change) -> HubResult<()> {
         match change {
-            Change::DpiStages { stages, active: _ } => {
-                let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
-                last.dpi_sum = stages.len() as u8;
-                for (i, s) in stages.iter().enumerate() {
-                    if i < 6 {
+            Change::DpiStages { stages, active } => {
+                {
+                    let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                    let selected = (*active).min(5) as u8;
+                    last.usb_dpi_index = selected;
+                    last.g_dpi_index = selected;
+                    last.dpi_sum = stages.len().min(6) as u8;
+                    for (i, s) in stages.iter().take(6).enumerate() {
                         last.dpi[i] = s.x as u16;
                     }
+                    let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                    Self::write_dpi(&dev, &last)?;
                 }
-                // build dpiToArr data: profileIndex, dpiDirection=0, dpiHasY=0, dpiSum, usbDpiIndex, dpi0..dpi5
-                let mut data: Vec<u8> = Vec::new();
-                data.push(last.profile_index);
-                data.push(0); // dpiDirection
-                data.push(0); // dpiHasY
-                data.push(last.dpi_sum);
-                data.push(last.usb_dpi_index);
-                for i in 0..6usize {
-                    let v = last.dpi[i];
-                    data.push((v & 0xFF) as u8);
-                    data.push(((v >> 8) & 0xFF) as u8);
+                // Verify from the device instead of trusting the write call.
+                std::thread::sleep(Duration::from_millis(120));
+                let check = self.read()?;
+                let stored = check
+                    .mouse
+                    .ok_or_else(|| HubError::Protocol("missing mouse state".into()))?;
+                let expected: Vec<u32> = stages.iter().take(6).map(|s| s.x).collect();
+                let actual: Vec<u32> = stored.stages.iter().map(|s| s.x).collect();
+                if actual != expected {
+                    return Err(HubError::Protocol(format!(
+                        "DPI write did not persist (expected {expected:?}, got {actual:?})"
+                    )));
                 }
-                let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
-                Self::write_report(&dev, 0x0103, &data)?;
                 Ok(())
             }
             Change::ActiveStage(idx) => {
-                let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
-                last.g_dpi_index = *idx as u8;
-                // send allInfo
-                let data = build_all_info(&last);
-                let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
-                Self::write_report(&dev, 0x0102, &data)?;
+                {
+                    let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                    let selected = (*idx).min(5) as u8;
+                    last.usb_dpi_index = selected;
+                    last.g_dpi_index = selected;
+                    let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                    Self::write_dpi(&dev, &last)?;
+                }
+                std::thread::sleep(Duration::from_millis(120));
+                let check = self.read()?;
+                let stored = check
+                    .mouse
+                    .ok_or_else(|| HubError::Protocol("missing mouse state".into()))?;
+                if stored.active_stage != (*idx).min(5) {
+                    return Err(HubError::Protocol(format!(
+                        "DPI stage write did not persist (expected {}, got {})",
+                        idx, stored.active_stage
+                    )));
+                }
                 Ok(())
             }
             Change::Setting { id, value } => {
-                let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
-                match id.as_str() {
-                    "polling_rate" => {
-                        if let SettingValue::Choice(v) = value {
-                            let idx = Self::hz_to_rate_index(*v as u32);
-                            last.g_rate_index = idx;
-                        }
-                    }
-                    "polling_wireless" => {
-                        if let SettingValue::Choice(v) = value {
-                            let idx = Self::hz_to_rate_index(*v as u32);
+                let expected = match id.as_str() {
+                    "polling_rate" | "polling_wireless" => {
+                        let SettingValue::Choice(v) = value else {
+                            return Err(HubError::Invalid("rate must be a choice".into()));
+                        };
+                        let idx = Self::hz_to_rate_index(*v as u32);
+                        {
+                            let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                            // MCHOSE HUB: `reportParser [0x41, usbRate, freeRate]`.
+                            // In 2.4G mode it writes freeRate; in wired it writes usbRate.
+                            // On-device verification shows the selected rate is reflected
+                            // in allInfo `usb_rate_index` (byte 2, high nibble).
+                            let (usb, free) = if id == "polling_wireless" || last.connect_mode {
+                                (0, idx)
+                            } else {
+                                (idx, 0)
+                            };
                             last.usb_rate_index = idx;
+                            last.g_rate_index = free;
+                            let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                            Self::write_rate(&dev, usb, free)?;
                         }
+                        SettingValue::Choice(Self::rate_index_to_hz(idx) as i64)
                     }
                     "sleep" => {
-                        if let SettingValue::Num(v) = value {
-                            last.sleep = *v as u8;
+                        let SettingValue::Num(v) = value else {
+                            return Err(HubError::Invalid("sleep must be a number".into()));
+                        };
+                        let v = (*v).clamp(0., 30.) as u8;
+                        {
+                            let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                            last.sleep = v;
+                            let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                            Self::write_report(
+                                &dev,
+                                0x11,
+                                &[0x0A, if v > 0 { 1 } else { 0 }, v],
+                            )?;
                         }
+                        SettingValue::Num(v as f32)
                     }
                     "debounce_press" => {
-                        if let SettingValue::Num(v) = value {
-                            last.key_debounce = *v as u8;
+                        let SettingValue::Num(v) = value else {
+                            return Err(HubError::Invalid("debounce must be a number".into()));
+                        };
+                        let v = (*v).clamp(0., 20.) as u8;
+                        {
+                            let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                            last.key_debounce = v;
+                            let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                            Self::write_report(&dev, 0x11, &[0x43, v])?;
                         }
-                    }
-                    "sensor_angle" => {
-                        if let SettingValue::Num(v) = value {
-                            last.rotate_val = *v as u8;
-                        }
+                        SettingValue::Num(v as f32)
                     }
                     _ => return Err(HubError::Unsupported("setting")),
+                };
+                std::thread::sleep(Duration::from_millis(120));
+                let check = self.read()?;
+                let actual = check
+                    .settings
+                    .get(id)
+                    .ok_or_else(|| HubError::Protocol("setting missing after write".into()))?;
+                if *actual == expected {
+                    Ok(())
+                } else {
+                    Err(HubError::Protocol(format!(
+                        "{id} write did not persist (expected {expected:?}, got {actual:?})"
+                    )))
                 }
-                let data = build_all_info(&last);
-                let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
-                Self::write_report(&dev, 0x0102, &data)?;
-                Ok(())
             }
             Change::Lighting { .. } => Err(HubError::Unsupported("lighting")),
             Change::Button { .. } => Err(HubError::Unsupported("button")),

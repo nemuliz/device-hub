@@ -1116,15 +1116,24 @@ get/set は cmd が +0x80/同一値の関係。`devID` はプロファイル番�
  - Requires a serial transport backend in devhub-hid (not yet implemented); registered as unsupported.
 
 ## MCHOSE L7 Ultra (VID 0x5253 PID 0x1020)
- - Config interface: usage page 0xFF0B / usage 0x0104 (64B feature report).
- - Read (feature report, body = [cmd, sub, 0xFF x62]):
+ - Config interface: usage page 0xFF01 / usage 0x0001 (HID feature reports).
+ - Read: send `[report, sub^0xFF, 0xFF...]`, wait, then get report; response is
+   XOR 0xFF inverted and starts with an echoed subcommand, which is stripped.
      0x11 0x06  mouseDeviceRead (vid,pid,fwVersion,connectMode,connectStatus,batteryLevel,chargeStatus)
+     0x11 0x04  firmware string (length-prefixed ASCII, e.g. "5.14.5.1")
      0x12 0x67  mouseAllRead (profileIndex,gDpiIndex/gRateIndex,usbDpiIndex/usbRateIndex,dpi0..5,
-                  dpiSum,sensor,keyDebounce,sleep,buttonType/Index/Value x6, reserved x5,rotateVal,val,dpiVal0..5)
-     0x11 0x1b  mouseLightRead (enable,id,useIndependent,brightness,lightSetting,closeTime,speed,
-                  openRandomColor,rgb,rgb2,changeDirect)
- - Write (output report id 0x4D, getCommandBuffer layout):
-     [flags=1, len, cmdId_lo, cmdId_hi, bizCode=0, seq=0, data..., xor, 0...]
-     cmdId: 0x0101 mouseKeyToArr, 0x0102 allInfoToArr, 0x0103 dpiToArr,
-            0x0104 setSingleDpi, 0x0109 lodToArr, 0x010a adaptivePowerToArr.
- - Driver: crates/devhub-hid/src/mchose.rs (read + DPI/polling/sleep/debounce/angle writes).
+                  dpiSum,sensor,keyDebounce,sleep,...)
+ - **Bit order**: mouseAllReadParser/mouseDeviceReadParser use binary-parser
+   `endianness("little")`, so consecutive `bit4` fields come from the **low
+   nibble first**. Verified on device: allInfo `00 23 23 03` means
+   gDpi=3/gRate=2/usbDpi=3/usbRate=2. connectMode is `device[8] & 0x07`
+   (0=wired, 1=2.4G), not bit 0x08.
+ - Write: `[report, data^0xFF..., 0xFF padding]` (report 0x11 = 20B,
+   report 0x12 = 64B):
+     0x12 0x40  dpiXYSetParser `[cmd, usbDpiIndex, gDpiIndex, reserved,
+                 dpi0..5 u16LE, dpiSum, diff, dpiVal0..5 u16LE]`
+     0x11 0x41  reportParser `[cmd, usbRate, freeRate]`
+     0x11 0x0A  sleep, 0x11 0x43 debounce
+ - Rate map: `[125, 500, 1000, 2000, 4000, 8000]`; in 2.4G mode HUB writes
+   `freeRate`, in wired mode `usbRate`.
+ - Driver: crates/devhub-hid/src/mchose.rs (read + DPI/polling/sleep/debounce writes).
