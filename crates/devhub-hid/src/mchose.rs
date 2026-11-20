@@ -72,10 +72,11 @@ fn build_all_info(last: &AllRead) -> Vec<u8> {
 
 impl MchoseMouse {
     fn send_feature_read(dev: &hidapi::HidDevice, cmd: u8, sub: u8) -> HubResult<Vec<u8>> {
-        // body = [cmd, sub, 0xFF, 0xFF, ...] (64B) — cmd が report id
+        // body = [cmd, sub^0xFF, 0xFF, 0xFF, ...] (64B) — cmd が report id、
+        // サブコマンド以降は XOR 0xFF で反転して送る (JS の readCommand と同じ)。
         let mut buf = [0xFFu8; 64];
         buf[0] = cmd;
-        buf[1] = sub;
+        buf[1] = sub ^ 0xFF;
         dev.send_feature_report(&buf)
             .map_err(|e| HubError::Io(format!("mchose feature write: {e}")))?;
         // 応答: get_feature_report は buf[0] に report id を入れて要求
@@ -225,7 +226,7 @@ fn build_caps() -> Capabilities {
         SettingSpec::choice(
             "polling_rate",
             PERFORMANCE,
-            "ポーリングレート",
+            "ポーリングレート (有線)",
             vec![
                 ChoiceOpt::new(125, "125"),
                 ChoiceOpt::new(250, "250"),
@@ -237,6 +238,21 @@ fn build_caps() -> Capabilities {
             ],
         )
         .help("マウス→PC 間の報告頻度 (Hz)"),
+        SettingSpec::choice(
+            "polling_wireless",
+            PERFORMANCE,
+            "ポーリングレート (無線)",
+            vec![
+                ChoiceOpt::new(125, "125"),
+                ChoiceOpt::new(250, "250"),
+                ChoiceOpt::new(500, "500"),
+                ChoiceOpt::new(1000, "1K"),
+                ChoiceOpt::new(2000, "2K"),
+                ChoiceOpt::new(4000, "4K"),
+                ChoiceOpt::new(8000, "8K"),
+            ],
+        )
+        .help("無線時の報告頻度 (Hz)"),
         SettingSpec::slider("sleep", PERFORMANCE, "スリープ時間", 0., 30., 1., "分"),
         SettingSpec::slider("debounce_press", CLICK, "クリックデバウンス", 0., 20., 1., "ms"),
         SettingSpec::slider("sensor_angle", SENSOR, "センサー角度", -30., 30., 1., "°"),
@@ -363,6 +379,7 @@ impl DeviceDriver for MchoseMouse {
             settings: {
                 let mut m = std::collections::BTreeMap::new();
                 m.insert("polling_rate".into(), SettingValue::Choice(MchoseMouse::rate_index_to_hz(last.g_rate_index) as i64));
+                m.insert("polling_wireless".into(), SettingValue::Choice(MchoseMouse::rate_index_to_hz(last.usb_rate_index) as i64));
                 m.insert("sleep".into(), SettingValue::Num(last.sleep as f32));
                 m.insert("debounce_press".into(), SettingValue::Num(last.key_debounce as f32));
                 m.insert("sensor_angle".into(), SettingValue::Num(last.rotate_val as f32));
@@ -428,6 +445,11 @@ impl DeviceDriver for MchoseMouse {
                         if let SettingValue::Choice(v) = value {
                             let idx = Self::hz_to_rate_index(*v as u32);
                             last.g_rate_index = idx;
+                        }
+                    }
+                    "polling_wireless" => {
+                        if let SettingValue::Choice(v) = value {
+                            let idx = Self::hz_to_rate_index(*v as u32);
                             last.usb_rate_index = idx;
                         }
                     }
