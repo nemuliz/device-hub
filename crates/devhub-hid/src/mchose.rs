@@ -113,9 +113,12 @@ impl MchoseMouse {
         }
         buf[6 + data.len()] = xor;
         // L7 Ultra の書き込みは feature report (report id 0x12, 64B) を使う。
+        // 書き込みデータは反転 (XOR 0xFF) で送る (キャプチャで確認)。
         let mut out = [0u8; 65];
         out[0] = 0x12;
-        out[1..].copy_from_slice(&buf);
+        for (i, b) in buf.iter().enumerate() {
+            out[1 + i] = b ^ 0xFF;
+        }
         dev.send_feature_report(&out)
             .map_err(|e| HubError::Io(format!("mchose write: {e}")))?;
         // 少し待つ (デバイス処理)
