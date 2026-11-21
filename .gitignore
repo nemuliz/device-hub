@@ -26,6 +26,7 @@ dist/
 /analysis/
 /.private-analysis/
 
-# ビルドログ
+# ビルド
+build-release.bat
 build-ok.txt
 build.log

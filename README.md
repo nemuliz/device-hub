@@ -1,3 +1,4 @@
+This is a fork with MCHOSE L7 Ultra and HM66(WIP) support!
 # Device HUB
 
 A native Windows configurator for magnetic-switch keyboards, Hall-effect mice, and
