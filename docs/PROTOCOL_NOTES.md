@@ -1106,14 +1106,30 @@ get/set は cmd が +0x80/同一値の関係。`devID` はプロファイル番�
   プロファイルをリセット / 完全初期化。X-Y軸分離は DPI タブの X/Y 切り替えで扱う (設定行には出さない)。
 
 
-## HM66 (Sikakeyb Castle) — serial protocol (captured 2026-11-20)
+## HM66 (Sikakeyb Castle) - serial protocol (captured 2026-11-20)
  - VID 0xC019 PID 0x1234, CDC ACM on COM (QSerialPort). Config is NOT over HID.
  - Frame size 32 bytes. Leading command byte:
    - 0x17 0x01 0x00 0x83 ...  : read settings (response echoes same header + payload)
    - 0x16 0xNN ...              : per-key / lighting writes (response echoes)
    - 0x19 0xXX ...              : key-matrix reads (32B pages)
    - 0x01 0x02 0x06 ...         : bulk keymap dump
- - Requires a serial transport backend in devhub-hid (not yet implemented); registered as unsupported.
+ - Backend: `crates/devhub-hid/src/serial.rs` (Windows CDC via kernel32) +
+   `crates/devhub-hid/src/hm66.rs` (Stage A, read-only).
+ - Scan probe: enumerates candidate COM ports by searching Windows USB enum
+   `PortName` entries under keys containing `VID_C019&PID_1234` (including
+   interface instances such as `...&MI_01`), then at 9600 8N1 sends a Stage A
+   read probe (`17 01 00 83` + zero padding, 32 B). The port is registered as
+   `serial:0c19:1234:<COM>` based on VID/PID-matched port discovery (a header
+   echo is expected by capture notes but has not been observed on all setups).
+   - Caution: probe still sends a read command to matching HM66 ports; if no
+     matching `PortName` is found, no broad COM scan is performed.
+ - Read: opens the COM port and sends the same read command; any response bytes
+   are saved for Stage A debugging
+   (`%TEMP%\opencode\hm66_last_frame.hex`, header-matched frames are also kept
+   in memory), but payload is not decoded yet (driver returns empty keyboard
+   state). No verified keymap/layout decode from device.
+ - Writes/apply: **not implemented** (Stage B). Per-setting Sikakeyb captures
+   are required before any write path is added.
 
 ## MCHOSE L7 Ultra (VID 0x5253 PID 0x1020)
  - Config interface: usage page 0xFF01 / usage 0x0001 (HID feature reports).
@@ -1136,4 +1152,12 @@ get/set は cmd が +0x80/同一値の関係。`devID` はプロファイル番�
      0x11 0x0A  sleep, 0x11 0x43 debounce
  - Rate map: `[125, 500, 1000, 2000, 4000, 8000]`; in 2.4G mode HUB writes
    `freeRate`, in wired mode `usbRate`.
- - Driver: crates/devhub-hid/src/mchose.rs (read + DPI/polling/sleep/debounce writes).
+ - **0x11 0x42 sensor/perf** (lodParser): `[cmd=0x42, lod, ripple, line,
+   motionSync, reserved, reserved2, gameMode, rotateOpen, rotateVal]`.
+   - `lod`: 0=0.7mm, 1=1mm, 2=2mm (L7 Ultra). `ripple/line/motionSync`:
+     1=on, 2=off. `gameMode`: 1=性能, 2=eスポーツ, 3=超競.
+   - Readback via `mouseAllRead` sensor byte (data[17]): bit0-1 LOD
+     (`00`->0.7mm, `01`->1mm, `10`->2mm), bit2 ripple, bit3 line correction,
+     bit4 motion sync, bit6-7 mode (`00` 性能, `10` eスポーツ, `11` 超競).
+     `rotateVal` at data[49].
+ - Driver: crates/devhub-hid/src/mchose.rs (read + DPI/polling/sleep/debounce + sensor/perf 0x42 writes).

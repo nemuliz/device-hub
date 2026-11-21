@@ -4,7 +4,6 @@
 //! kernel32 の CreateFile/ReadFile/WriteFile/SetCommState を直接叩く。
 
 use devhub_core::backend::{HubError, HubResult};
-use std::io::{Read, Write};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -75,7 +74,6 @@ const INVALID_HANDLE: isize = -1;
 
 pub struct SerialPort {
     handle: isize,
-    pub baud: u32,
 }
 
 impl SerialPort {
@@ -128,7 +126,7 @@ impl SerialPort {
                 return Err(HubError::Io(format!("SetCommTimeouts {port} failed")));
             }
         }
-        Ok(Self { handle: h, baud })
+        Ok(Self { handle: h })
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> HubResult<usize> {

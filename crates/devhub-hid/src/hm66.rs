@@ -9,12 +9,13 @@ use devhub_core::backend::*;
 use devhub_core::model::*;
 use devhub_core::registry;
 use std::sync::Mutex;
-use std::time::Duration;
 
 pub struct Hm66Keyboard {
     port: Mutex<crate::serial::SerialPort>,
     info: Mutex<DeviceInfo>,
     caps: Capabilities,
+    #[allow(dead_code)]
+    last_frame: Mutex<Vec<u8>>,
 }
 
 pub fn open(info: DeviceInfo) -> HubResult<Hm66Keyboard> {
@@ -29,11 +30,11 @@ pub fn open(info: DeviceInfo) -> HubResult<Hm66Keyboard> {
         port: Mutex::new(sp),
         info: Mutex::new(info),
         caps,
+        last_frame: Mutex::new(Vec::new()),
     })
 }
 
 fn build_caps() -> Capabilities {
-    use devhub_core::registry;
     Capabilities {
         settings: vec![],
         actions: vec![],
@@ -64,13 +65,13 @@ impl DeviceDriver for Hm66Keyboard {
     }
     fn read(&self) -> HubResult<DeviceState> {
         let mut port = self.port.lock().unwrap_or_else(|p| p.into_inner());
-        // 読み取りコマンド送信
+        // 読み取りコマンド送信 (Stage A: 設定読み取り)
         let mut cmd = [0u8; 32];
         cmd[0] = 0x17;
         cmd[1] = 0x01;
         cmd[2] = 0x00;
         cmd[3] = 0x83;
-        let _ = port.write_all(&cmd);
+        port.write_all(&cmd)?;
         // 応答待ち
         let mut buf = [0u8; 32];
         let mut got = 0usize;
@@ -83,6 +84,29 @@ impl DeviceDriver for Hm66Keyboard {
             }
         }
         drop(port);
+        // Stage A: 応答があれば保持・保存（payload は未デコード）
+        if got > 0 {
+            let header_ok =
+                got >= 4 && buf[0] == 0x17 && buf[1] == 0x01 && buf[2] == 0x00 && buf[3] == 0x83;
+            if header_ok {
+                if let Ok(mut lf) = self.last_frame.lock() {
+                    lf.clear();
+                    lf.extend_from_slice(&buf[..got]);
+                }
+            }
+            // 解析材料用: 読取専用で最新フレームをhex保存（失敗は無視）
+            if std::env::var_os("DEVHUB_HM66_DEBUG").is_some() {
+                let hex = buf[..got]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = std::fs::write(
+                    r"C:\Users\nemuliz\AppData\Local\Temp\opencode\hm66_last_frame.hex",
+                    format!("len={got}\nheader_match={header_ok}\n{hex}\n"),
+                );
+            }
+        }
         // バッテリー等は応答から取れない (HM66 はバッテリー無し有線)。空の state を返す。
         Ok(DeviceState {
             profile: ProfileState { active: 0, names: vec![] },

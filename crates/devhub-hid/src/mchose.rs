@@ -11,6 +11,7 @@
 //!   - レート: report `0x11` / command `0x41` (reportParser)
 //!   - スリープ: report `0x11` / command `0x0A`
 //!   - デバウンス: report `0x11` / command `0x43`
+//!   - センサー/性能: report `0x11` / command `0x42` (LOD, Motion Sync, リップル, ライン補正, モード)
 
 use devhub_core::backend::*;
 use devhub_core::model::*;
@@ -41,6 +42,14 @@ struct AllRead {
     fw_version: u32,
     /// `deviceInfo.connectMode` from `0x11 0x06` (true = 2.4G wireless).
     connect_mode: bool,
+    /// 0=0.7mm, 1=1mm, 2=2mm (L7 Ultra 3段階; mouseAllRead sensor bit0-1)
+    lod_index: u8,
+    /// 0=性能モード, 1=eスポーツモード, 2=超競モード (sensor bit6-7)
+    mode: u8,
+    ripple: bool,
+    line_correction: bool,
+    motion_sync: bool,
+    rotate_open: u8,
 }
 
 impl MchoseMouse {
@@ -119,6 +128,24 @@ impl MchoseMouse {
         Self::write_report(dev, 0x11, &[0x41, usb_rate, free_rate])
     }
 
+    /// `0x11 0x42` センサー/性能コマンド (LOD, Motion Sync, リップル, ライン補正, モード)。
+    /// フィールド順は MCHOSE HUB の lodParser/setMap に合わせる。
+    fn write_sensor_perf(dev: &hidapi::HidDevice, last: &AllRead) -> HubResult<()> {
+        let data = [
+            0x42,
+            last.lod_index,
+            if last.ripple { 1 } else { 2 },
+            if last.line_correction { 1 } else { 2 },
+            if last.motion_sync { 1 } else { 2 },
+            0,
+            0,
+            last.mode + 1, // 1=性能, 2=eスポーツ, 3=超競
+            last.rotate_open,
+            last.rotate_val,
+        ];
+        Self::write_report(dev, 0x11, &data)
+    }
+
     fn parse_all(data: &[u8]) -> AllRead {
         let mut a = AllRead::default();
         if data.len() < 63 {
@@ -140,12 +167,33 @@ impl MchoseMouse {
         }
         a.dpi_sum = data[16];
         a.sensor = data[17];
+        // mouseAllRead sensor bits (LSB-first in UI logic): bit0+bit1 encode LOD.
+        // 0b00=0.7mm, 0b01=1mm, 0b10=2mm (L7 Ultra 3-level).
+        let lod_bits = a.sensor & 0x03;
+        a.lod_index = match lod_bits {
+            0b01 => 1, // 1mm
+            0b10 => 2, // 2mm
+            _ => 0,    // 0.7mm
+        };
+        a.ripple = a.sensor & 0x04 != 0;
+        a.line_correction = a.sensor & 0x08 != 0;
+        a.motion_sync = a.sensor & 0x10 != 0;
+        let bit6 = a.sensor & 0x40 != 0;
+        let bit7 = a.sensor & 0x80 != 0;
+        a.mode = if !bit7 {
+            0 // 性能モード
+        } else if !bit6 {
+            1 // eスポーツモード
+        } else {
+            2 // 超競モード
+        };
         a.key_debounce = data[18];
         a.sleep = data[19];
         // rotateVal at 49
         if data.len() > 49 {
             a.rotate_val = data[49];
         }
+        a.rotate_open = if a.rotate_val != 0 { 1 } else { 0 };
         // battery/fw not here
         a
     }
@@ -243,6 +291,17 @@ fn build_caps() -> Capabilities {
     use section::*;
     let settings = vec![
         SettingSpec::choice(
+            "mode",
+            PERFORMANCE,
+            "モード",
+            vec![
+                ChoiceOpt::new(0, "性能モード"),
+                ChoiceOpt::new(1, "eスポーツモード"),
+                ChoiceOpt::new(2, "超競モード"),
+            ],
+        )
+        .help("性能/ゲーム向けの動作モード"),
+        SettingSpec::choice(
             "polling_rate",
             PERFORMANCE,
             "ポーリングレート",
@@ -270,6 +329,23 @@ fn build_caps() -> Capabilities {
             ],
         )
         .help("無線時の報告頻度 (Hz)"),
+        SettingSpec::choice(
+            "lod",
+            SENSOR,
+            "LOD",
+            vec![
+                ChoiceOpt::new(0, "0.7 mm"),
+                ChoiceOpt::new(1, "1 mm"),
+                ChoiceOpt::new(2, "2 mm"),
+            ],
+        )
+        .help("リフトオフ距離"),
+        SettingSpec::toggle("motion_sync", SENSOR, "Motion Sync")
+            .help("センサー信号とUSBポーリングの同期"),
+        SettingSpec::toggle("ripple_control", SENSOR, "リップルコントロール")
+            .help("高DPI時の微小な動きの補正"),
+        SettingSpec::toggle("line_correction", SENSOR, "ライン補正")
+            .help("直線移動の補正"),
         SettingSpec::slider("sleep", PERFORMANCE, "スリープ時間", 0., 30., 1., "分"),
         SettingSpec::slider("debounce_press", CLICK, "クリックデバウンス", 0., 20., 1., "ms"),
     ];
@@ -378,13 +454,24 @@ impl DeviceDriver for MchoseMouse {
             }),
             settings: {
                 let mut m = std::collections::BTreeMap::new();
+                m.insert("mode".into(), SettingValue::Choice(last.mode as i64));
                 // Observed on L7 Ultra (2.4G): `0x11 0x41 [cmd, usbRate, freeRate]`
                 // updates the high nibble of allInfo byte 2 (`usb_rate_index`), and
                 // this is the field that reflects the active polling rate after
                 // writes. Use it for the reported/verified rate.
                 let active_rate = last.usb_rate_index;
-                m.insert("polling_rate".into(), SettingValue::Choice(MchoseMouse::rate_index_to_hz(active_rate) as i64));
-                m.insert("polling_wireless".into(), SettingValue::Choice(MchoseMouse::rate_index_to_hz(last.usb_rate_index) as i64));
+                m.insert(
+                    "polling_rate".into(),
+                    SettingValue::Choice(MchoseMouse::rate_index_to_hz(active_rate) as i64),
+                );
+                m.insert(
+                    "polling_wireless".into(),
+                    SettingValue::Choice(MchoseMouse::rate_index_to_hz(last.usb_rate_index) as i64),
+                );
+                m.insert("lod".into(), SettingValue::Choice(last.lod_index as i64));
+                m.insert("motion_sync".into(), SettingValue::Bool(last.motion_sync));
+                m.insert("ripple_control".into(), SettingValue::Bool(last.ripple));
+                m.insert("line_correction".into(), SettingValue::Bool(last.line_correction));
                 m.insert("sleep".into(), SettingValue::Num(last.sleep as f32));
                 m.insert("debounce_press".into(), SettingValue::Num(last.key_debounce as f32));
                 m
@@ -464,6 +551,19 @@ impl DeviceDriver for MchoseMouse {
             }
             Change::Setting { id, value } => {
                 let expected = match id.as_str() {
+                    "mode" => {
+                        let SettingValue::Choice(v) = value else {
+                            return Err(HubError::Invalid("mode must be a choice".into()));
+                        };
+                        let v = (*v).clamp(0, 2) as u8;
+                        {
+                            let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                            last.mode = v;
+                            let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                            Self::write_sensor_perf(&dev, &last)?;
+                        }
+                        SettingValue::Choice(v as i64)
+                    }
                     "polling_rate" | "polling_wireless" => {
                         let SettingValue::Choice(v) = value else {
                             return Err(HubError::Invalid("rate must be a choice".into()));
@@ -486,6 +586,55 @@ impl DeviceDriver for MchoseMouse {
                             Self::write_rate(&dev, usb, free)?;
                         }
                         SettingValue::Choice(Self::rate_index_to_hz(idx) as i64)
+                    }
+                    "lod" => {
+                        let SettingValue::Choice(v) = value else {
+                            return Err(HubError::Invalid("lod must be a choice".into()));
+                        };
+                        let v = (*v).clamp(0, 2) as u8;
+                        {
+                            let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                            last.lod_index = v;
+                            let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                            Self::write_sensor_perf(&dev, &last)?;
+                        }
+                        SettingValue::Choice(v as i64)
+                    }
+                    "motion_sync" => {
+                        let SettingValue::Bool(v) = value else {
+                            return Err(HubError::Invalid("motion_sync must be a toggle".into()));
+                        };
+                        {
+                            let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                            last.motion_sync = *v;
+                            let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                            Self::write_sensor_perf(&dev, &last)?;
+                        }
+                        SettingValue::Bool(*v)
+                    }
+                    "ripple_control" => {
+                        let SettingValue::Bool(v) = value else {
+                            return Err(HubError::Invalid("ripple_control must be a toggle".into()));
+                        };
+                        {
+                            let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                            last.ripple = *v;
+                            let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                            Self::write_sensor_perf(&dev, &last)?;
+                        }
+                        SettingValue::Bool(*v)
+                    }
+                    "line_correction" => {
+                        let SettingValue::Bool(v) = value else {
+                            return Err(HubError::Invalid("line_correction must be a toggle".into()));
+                        };
+                        {
+                            let mut last = self.last_all.lock().unwrap_or_else(|p| p.into_inner());
+                            last.line_correction = *v;
+                            let dev = self.dev.lock().unwrap_or_else(|p| p.into_inner());
+                            Self::write_sensor_perf(&dev, &last)?;
+                        }
+                        SettingValue::Bool(*v)
                     }
                     "sleep" => {
                         let SettingValue::Num(v) = value else {

@@ -147,37 +147,89 @@ impl HubBackend for RealHub {
             });
         }
         // ---------------------------------------------------------------- シリアル (HM66 等)
-        // COM1..COM20 を短いタイムアウトでプローブし、HM66 の読み取りコマンドに
-        // 応答するポートを HM66 として登録する (HID 列挙では見えない)。
-        for n in 1u8..=20 {
-            let port = format!("COM{}", n);
-            // 既に登録済みならスキップ (パスが同じなら再プローブしない)
-            let already = paths.values().any(|p| p.to_string_lossy() == port);
-            if already {
+        // HID 列挙では見えない CDC デバイス。Windows レジストリから
+        // VID_C019&PID_1234 に紐づく COM ポートのみを候補にし、Stage A の
+        // 読み取りプローブを試して登録する（読取のみ・無関係な COM への書き込みを避ける）。
+        let hm66_candidates = hm66_candidate_ports();
+        let mut hm66_log = format!("candidates={hm66_candidates:?}\n");
+        for port in hm66_candidates {
+            let id = DeviceId(format!("serial:0c19:1234:{}", port));
+            // ドライバがポートを排他オープン保持している間は再プローブすると失敗し、
+            // スキャン結果から消えて点滅するため、キャッシュ済みならそのまま維持する。
+            let cached = self
+                .drivers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&id.0);
+            let same_path = prev_paths
+                .get(&id.0)
+                .map(|p| p.to_string_lossy() == port)
+                .unwrap_or(false);
+            if cached && same_path {
+                paths.insert(id.0.clone(), std::ffi::CString::new(port.clone()).unwrap());
+                if !out.iter().any(|o| o.id == id) {
+                    out.push(DeviceInfo {
+                        id: id.clone(),
+                        kind: DeviceKind::Keyboard,
+                        name: "HM66".into(),
+                        vendor: "Sikakeyb".into(),
+                        model: "hm66".into(),
+                        vid: 0x0C19,
+                        pid: 0x1234,
+                        transport: Transport::Wired,
+                        firmware: None,
+                        dongle_firmware: None,
+                        serial: Some(port.clone()),
+                        driver: DriverKind::Hm66,
+                        battery: None,
+                        supported: true,
+                        asleep: false,
+                        board_id: None,
+                    });
+                }
+                hm66_log.push_str(&format!("{port}: cached driver kept\n"));
                 continue;
             }
-            // プローブ: ポートを開き、HM66 の read コマンドを送って応答を確認
-            if let Ok(mut sp) = serial::SerialPort::open(&port, 9600) {
-                // 送信: 0x17 0x01 0x00 0x83 + 28 bytes 0x00 (32 bytes)
-                let mut cmd = [0u8; 32];
-                cmd[0] = 0x17;
-                cmd[1] = 0x01;
-                cmd[2] = 0x00;
-                cmd[3] = 0x83;
-                let _ = sp.write_all(&cmd);
-                // 応答待ち (最大 ~250ms)
-                let mut buf = [0u8; 32];
-                let mut got = 0usize;
-                let start = std::time::Instant::now();
-                while got < 32 && start.elapsed().as_millis() < 250 {
-                    match sp.read(&mut buf[got..]) {
-                        Ok(0) => break,
-                        Ok(k) => got += k,
-                        Err(_) => break,
+            // 同一スキャン内で重複しないよう保険
+            if paths.values().any(|p| p.to_string_lossy() == port) {
+                continue;
+            }
+            // プローブ: VID/PID 一致の候補ポートに Stage A の読取コマンドを試し、
+            // 応答有無に関わらず登録する（実機で無応答ケースあり。読取のみ・未検証）。
+            match serial::SerialPort::open(&port, 9600) {
+                Ok(mut sp) => {
+                    hm66_log.push_str(&format!("{port}: open ok\n"));
+                    // 送信: 0x17 0x01 0x00 0x83 + 28 bytes 0x00 (32 bytes)
+                    let mut cmd = [0u8; 32];
+                    cmd[0] = 0x17;
+                    cmd[1] = 0x01;
+                    cmd[2] = 0x00;
+                    cmd[3] = 0x83;
+                    let wrote = sp.write_all(&cmd).is_ok();
+                    hm66_log.push_str(&format!("{port}: probe write={wrote}\n"));
+                    // 応答待ち (最大 ~250ms)
+                    let mut buf = [0u8; 32];
+                    let mut got = 0usize;
+                    let start = std::time::Instant::now();
+                    while got < 32 && start.elapsed().as_millis() < 250 {
+                        match sp.read(&mut buf[got..]) {
+                            Ok(0) => break,
+                            Ok(k) => got += k,
+                            Err(_) => break,
+                        }
                     }
-                }
-                if got >= 4 && buf[0] == 0x17 && buf[1] == 0x01 && buf[2] == 0x00 && buf[3] == 0x83 {
-                    let id = DeviceId(format!("serial:0c19:1234:{}", port));
+                    hm66_log.push_str(&format!("{port}: probe bytes={got}\n"));
+                    if got > 0 && std::env::var_os("DEVHUB_HM66_DEBUG").is_some() {
+                        let hex = buf[..got]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let _ = std::fs::write(
+                            r"C:\Users\nemuliz\AppData\Local\Temp\opencode\hm66_probe_frame.hex",
+                            format!("port={port}\nlen={got}\n{hex}\n"),
+                        );
+                    }
                     if out.iter().any(|o| o.id == id) {
                         continue;
                     }
@@ -200,8 +252,18 @@ impl HubBackend for RealHub {
                         asleep: false,
                         board_id: None,
                     });
+                    hm66_log.push_str(&format!("{port}: registered\n"));
+                }
+                Err(e) => {
+                    hm66_log.push_str(&format!("{port}: open failed: {e}\n"));
                 }
             }
+        }
+        if std::env::var_os("DEVHUB_HM66_DEBUG").is_some() {
+            let _ = std::fs::write(
+                r"C:\Users\nemuliz\AppData\Local\Temp\opencode\hm66_scan.log",
+                hm66_log,
+            );
         }
         // 抜かれた/差し直されたデバイスのキャッシュは死んだハンドル — パスが
         // 前回と一致するものだけ残し、他は捨てて次回 driver() で開き直す。
@@ -404,6 +466,53 @@ impl RealHub {
         };
         Ok(drv)
     }
+}
+
+/// HM66 (VID 0xC019 PID 0x1234) に対応する COM ポート候補を Windows レジストリから列挙する。
+/// 見つからない/読めない場合は空（無関係な COM ポートをプローブしない）。
+fn hm66_candidate_ports() -> Vec<String> {
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args([
+        "query",
+        r"HKLM\SYSTEM\CurrentControlSet\Enum\USB",
+        "/s",
+        "/v",
+        "PortName",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current_key = String::new();
+    let mut ports = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("HKEY_") {
+            current_key = trimmed.to_ascii_uppercase();
+            continue;
+        }
+        if !current_key.contains("VID_C019&PID_1234") {
+            continue;
+        }
+        let Some(pos) = line.find("REG_SZ") else {
+            continue;
+        };
+        let val = line[pos + "REG_SZ".len()..].trim();
+        if val.starts_with("COM") && !ports.iter().any(|p| p == val) {
+            ports.push(val.to_string());
+        }
+    }
+    ports
 }
 
 /// `hid:<vid>:<pid>:<serial>` → (vid, pid)。
