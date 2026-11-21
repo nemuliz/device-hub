@@ -22,6 +22,10 @@ obs-gallery*.png
 prefs.json
 dist/
 
-# メーカー配布原本・解析用の抜粋（公開ツリーには入れない）
+# 解析用
 /analysis/
 /.private-analysis/
+
+# ビルドログ
+build-ok.txt
+build.log
